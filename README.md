@@ -28,6 +28,17 @@
   拒绝与幂等重放不产生事件；余额已在阈值之下的继续扣减也不算越线。
   当时间补充、撤销或策略更新（如调低阈值）使余额重新高于阈值后，
   后续再次越线会产生**新**事件。事件通过 `GET /events` 按 `id` 稳定递增分页读取。
+- **策略定时切换**：通过 `POST /policy-changes` 为**已有策略**登记一条未来 UTC
+  时刻（`effective_at`）生效的变更（新容量、新补充速率、新低余额阈值），以
+  唯一 `change_id` 幂等标识。同一策略至多一条**待生效**变更；待生效期间
+  `PUT /policies` 直接更新该策略会返回 `409`；生效前可用
+  `DELETE /policy-changes/{change_id}` 取消（重复取消幂等）。
+  **无需后台任务**：每次 `/decide`（含幂等重放）或撤销在同一
+  `BEGIN IMMEDIATE` 事务内先套用所有命中且到期的变更，再执行原裁决——
+  变更落库与本次裁决原子完成，并发请求只能观察到完整的旧状态或新状态。
+  套用时：桶先按**旧策略**补充到 `effective_at`，余额再按
+  `旧余额 / 旧容量 × 新容量` 等比缩放（**旧容量为 0 时余额为 0**），
+  随后按**新速率**从 `effective_at` 补充到裁决时刻。
 - **并发不超发**：SQLite 处于 WAL 模式，写事务一律 `BEGIN IMMEDIATE` 立即加写锁，
   配合 `busy_timeout=30s` 让并发写者排队，读-改-写序列天然串行化。
   单进程多线程、多进程（多个实例共享同一数据库文件）下均不会超发。
@@ -56,7 +67,10 @@ SQLite 数据文件保存在命名卷 `quota-data`（容器内 `/data/quota.db`�
 | --- | --- | --- |
 | `GET`  | `/health` | 健康检查 |
 | `GET`  | `/policies` | 列出全部策略 |
-| `PUT`  | `/policies` | 创建/更新一层策略（按 scope+tenant_id+route_id 幂等 upsert） |
+| `PUT`  | `/policies` | 创建/更新一层策略（按 scope+tenant_id+route_id 幂等 upsert；有待生效变更时 409） |
+| `GET`  | `/policy-changes` | 列出全部策略定时变更（待生效/已生效/已取消） |
+| `POST` | `/policy-changes` | 登记一条未来时刻生效的策略变更（同 change_id 重提幂等） |
+| `DELETE` | `/policy-changes/{change_id}` | 生效前取消一条变更（重复取消幂等） |
 | `GET`  | `/buckets` | 查看所有已创建桶补充后的实时余额（只读，不落库） |
 | `POST` | `/decide` | 提交一次多级裁决 |
 | `POST` | `/decide/{request_id}/revoke` | 撤销一次已通过的裁决（重复撤销幂等） |
@@ -266,6 +280,81 @@ curl -s 'http://localhost:8000/events?after_id=1&limit=10'
 ]
 ```
 
+### 8. 策略定时切换：登记、查询、到期自动套用与取消
+
+```bash
+# 先配置一层策略（变更只能挂在已有策略上）
+curl -s -X PUT http://localhost:8000/policies \
+  -H 'Content-Type: application/json' \
+  -d '{"scope":"global","capacity":10,"refill_rate":1}'
+
+# 计算一个未来 UTC 时刻（例：60 秒后，ISO 8601）
+EFFECTIVE_AT=$(python3 -c \
+  "from datetime import datetime,timedelta,timezone; \
+print((datetime.now(timezone.utc)+timedelta(seconds=60)).isoformat().replace('+00:00','Z'))")
+
+# 登记变更：到点后容量 20、2 令牌/秒、低余额阈值 4
+curl -s -X POST http://localhost:8000/policy-changes \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"change_id\": \"ch-20260917-001\",
+    \"scope\": \"global\",
+    \"capacity\": 20,
+    \"refill_rate\": 2,
+    \"low_balance_threshold\": 4,
+    \"effective_at\": \"$EFFECTIVE_AT\"
+  }"
+```
+
+成功返回 `201 Created`（相同 `change_id` + 相同载荷重提返回 `200`）：
+
+```json
+{
+  "change_id": "ch-20260917-001",
+  "scope": "global",
+  "tenant_id": null,
+  "route_id": null,
+  "capacity": 20.0,
+  "refill_rate": 2.0,
+  "low_balance_threshold": 4.0,
+  "effective_at": "2026-09-17T13:00:00.000000Z",
+  "status": "pending",
+  "created_at": "2026-09-17T12:59:00.000000Z",
+  "applied_at": null,
+  "cancelled_at": null
+}
+```
+
+到期后**不需要任何后台操作**：下一次裁决（即使是旧 `request_id` 的幂等重放）
+或撤销会在同一事务内自动套用，`GET /policy-changes` 中该记录变为
+`status="applied"` 并带 `applied_at`。余额迁移示例：旧容量 10、速率 1、
+到期时余额 6，则新容量 20 下余额先变为 `6/10×20 = 12`，再按 2 令牌/秒
+从生效时刻补充到裁决时刻。
+
+```bash
+# 待生效期间直接 PUT 同一策略 -> 409（须先取消或等其生效）
+curl -i -X PUT http://localhost:8000/policies \
+  -H 'Content-Type: application/json' \
+  -d '{"scope":"global","capacity":99,"refill_rate":1}'
+
+# 同一策略登记第二条待生效变更 -> 409
+curl -i -X POST http://localhost:8000/policy-changes \
+  -H 'Content-Type: application/json' \
+  -d '{"change_id":"ch-other","scope":"global","capacity":30,"refill_rate":1,"effective_at":"'$EFFECTIVE_AT'"}'
+
+# 生效前取消（再调一次幂等）；已生效的变更取消返回 409
+curl -s -X DELETE http://localhost:8000/policy-changes/ch-20260917-001
+
+# 查看全部变更（含 applied / cancelled 历史，按登记顺序）
+curl -s http://localhost:8000/policy-changes
+```
+
+> `effective_at` 必须是**未来**的 UTC ISO 8601 时间（如
+> `2026-09-17T13:00:00Z`），过去时间返回 `422`；目标策略不存在返回 `404`。
+> 阈值校验与 `PUT /policies` 一致：`null` 关闭，否则须在 `0` 到新 `capacity`
+> 之间。`GET /buckets` 为只读排障视图：对已到期但尚未被写请求套用的变更，
+> 会按相同规则投影出切换后的余额，但不会提前落库。
+
 ## 行为约定与边界
 
 - 桶首次被命中时按当前容量**满额**创建。
@@ -278,6 +367,11 @@ curl -s 'http://localhost:8000/events?after_id=1&limit=10'
 - 若一次裁决没有命中任何已配置的层级，返回 `404`（提示先配置策略）。
 - `cost ≤ 0` 返回 `422`；`route_id` 必须与 `tenant_id` 一起提供，否则 `422`；
   `low_balance_threshold` 超出 `[0, capacity]` 返回 `422`。
+- 定时变更只能挂在**已有策略**上（否则 `404`），`effective_at` 必须是未来
+  UTC 时间（否则 `422`）；同一策略至多一条待生效变更，重复登记或待生效期间
+  直接 `PUT` 该策略均返回 `409`；已生效的变更不可取消（`409`），取消不存在的
+  变更返回 `404`。到期套用是惰性的：没有任何裁决/撤销流量的策略即使过了
+  `effective_at` 也保持原状，直到首次写请求在同一事务内完成切换。
 - 裁决只保证「整组原子扣减」与最终一致；重试时间是服务端按补充率给出的建议值，
   期间若有其他裁决/撤销发生，实际结果仍以再次裁决为准。
 
@@ -300,6 +394,9 @@ QUOTA_DB_PATH=./quota.db .venv/bin/uvicorn app.main:app --reload --port 8000
 幂等重放、载荷冲突 409、撤销补回与幂等、补回不超容量、容量更新截断、
 低余额事件的越线触发/拒绝与重放不触发/补充、撤销、阈值调低后重新武装、
 多级同时越线各产一条、events 稳定分页、老库迁移补列，
+策略定时变更的登记校验/幂等/单待生效约束/PUT 409/取消生命周期/
+到期按比例缩放与新速率补充（旧容量 0、阈值切换、重放与撤销触发、
+只读投影）/并发登记与并发裁决原子切换，
 以及 20+ 线程并发与双进程共享同一数据库文件均不超发。
 
 ## 项目结构
@@ -307,7 +404,7 @@ QUOTA_DB_PATH=./quota.db .venv/bin/uvicorn app.main:app --reload --port 8000
 ```
 app/
   database.py   # SQLite 连接、WAL/busy_timeout、BEGIN IMMEDIATE 事务、建表与老库迁移
-  quota.py      # 策略 upsert、惰性补充、整组裁决、幂等存档、撤销与低余额事件
+  quota.py      # 策略 upsert、定时变更登记/取消/到期套用、惰性补充、整组裁决、幂等存档、撤销与低余额事件
   schemas.py    # Pydantic 请求/响应模型
   main.py       # FastAPI 路由
 tests/

@@ -68,6 +68,31 @@ CREATE TABLE IF NOT EXISTS low_balance_events (
     created_at     TEXT NOT NULL
 ) STRICT;
 
+-- 策略定时切换：同一策略至多一条 status='pending' 的待生效变更（见部分唯一索引）。
+-- 到点不依赖后台任务：每次裁决/撤销在同一写事务内先套用命中且到期的变更。
+-- status: 'pending' 待生效 | 'applied' 已生效 | 'cancelled' 生效前取消
+CREATE TABLE IF NOT EXISTS policy_changes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    change_id    TEXT NOT NULL UNIQUE,
+    scope        TEXT NOT NULL,
+    tenant_id    TEXT NOT NULL DEFAULT '',
+    route_id     TEXT NOT NULL DEFAULT '',
+    capacity     REAL NOT NULL CHECK (capacity >= 0),
+    refill_rate  REAL NOT NULL CHECK (refill_rate >= 0),
+    low_balance_threshold REAL
+        CHECK (low_balance_threshold IS NULL OR low_balance_threshold >= 0),
+    effective_at TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('pending', 'applied', 'cancelled')),
+    created_at   TEXT NOT NULL,
+    applied_at   TEXT,
+    cancelled_at TEXT
+) STRICT;
+
+-- 同一策略最多一条待生效变更；applied/cancelled 的历史记录不占位
+CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_changes_one_pending
+ON policy_changes (scope, tenant_id, route_id)
+WHERE status = 'pending';
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL

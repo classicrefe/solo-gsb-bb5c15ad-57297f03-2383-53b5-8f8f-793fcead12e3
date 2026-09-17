@@ -30,6 +30,38 @@ class PolicyOut(BaseModel):
     updated_at: str
 
 
+class PolicyChangeIn(BaseModel):
+    change_id: str = Field(..., min_length=1, description="本次变更的唯一幂等键")
+    scope: Literal["global", "tenant", "route"]
+    tenant_id: Optional[str] = Field(default=None, description="scope=tenant/route 时必填")
+    route_id: Optional[str] = Field(default=None, description="scope=route 时必填")
+    capacity: float = Field(..., ge=0, description="生效后的新桶容量")
+    refill_rate: float = Field(..., ge=0, description="生效后的新每秒补充令牌数")
+    low_balance_threshold: Optional[float] = Field(
+        default=None,
+        description="生效后的新低余额阈值：null 关闭；否则须在 0 到 capacity 之间",
+    )
+    effective_at: str = Field(
+        ...,
+        description="UTC 生效时刻（ISO 8601，建议以 Z 结尾），必须是未来时间",
+    )
+
+
+class PolicyChangeOut(BaseModel):
+    change_id: str
+    scope: str
+    tenant_id: Optional[str]
+    route_id: Optional[str]
+    capacity: float
+    refill_rate: float
+    low_balance_threshold: Optional[float]
+    effective_at: str
+    status: Literal["pending", "applied", "cancelled"]
+    created_at: str
+    applied_at: Optional[str] = None
+    cancelled_at: Optional[str] = None
+
+
 class DecideIn(BaseModel):
     request_id: str = Field(..., min_length=1, description="幂等键，相同 request_id 重放原结果")
     tenant_id: Optional[str] = None
