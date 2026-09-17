@@ -47,6 +47,45 @@ def payload_hash(payload: dict[str, Any]) -> str:
 # ---------------------------------------------------------------- 策略管理
 
 
+def _normalize_scope(
+    scope: str,
+    tenant_id: Optional[str],
+    route_id: Optional[str],
+) -> tuple[str, str]:
+    """把 (scope, tenant_id, route_id) 规范化成存储用的 (tenant, route)。
+
+    非法组合直接抛 422；各层空标识统一用空串。
+    """
+    tenant = tenant_id or EMPTY
+    route = route_id or EMPTY
+    if scope == "global":
+        return EMPTY, EMPTY
+    if scope == "tenant":
+        if not tenant:
+            raise HTTPException(422, "tenant 作用域必须提供 tenant_id")
+        return tenant, EMPTY
+    if scope == "route":
+        if not tenant or not route:
+            raise HTTPException(422, "route 作用域必须同时提供 tenant_id 与 route_id")
+        return tenant, route
+    raise HTTPException(422, f"非法 scope: {scope!r}")
+
+
+def _validate_policy_values(
+    capacity: float,
+    refill_rate: float,
+    low_balance_threshold: Optional[float],
+) -> None:
+    if capacity < 0 or refill_rate < 0:
+        raise HTTPException(422, "capacity 与 refill_rate 必须非负")
+    if low_balance_threshold is not None and not (
+        0.0 <= low_balance_threshold <= capacity
+    ):
+        raise HTTPException(
+            422, "low_balance_threshold 必须为 null（关闭）或在 0 到 capacity 之间"
+        )
+
+
 def list_policies(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
         "SELECT scope, tenant_id, route_id, capacity, refill_rate, "
@@ -54,6 +93,16 @@ def list_policies(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         "FROM policies ORDER BY scope, tenant_id, route_id"
     ).fetchall()
     return [_policy_out(r) for r in rows]
+
+
+def _pending_change(
+    conn: sqlite3.Connection, scope: str, tenant: str, route: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT change_id, effective_at FROM policy_changes "
+        "WHERE scope=? AND tenant_id=? AND route_id=? AND status='pending'",
+        (scope, tenant, route),
+    ).fetchone()
 
 
 def upsert_policy(
@@ -72,27 +121,20 @@ def upsert_policy(
     保证余额永远不超过当前容量。
     low_balance_threshold 为 None 时关闭该层的低余额事件；否则须在
     [0, capacity] 内。PUT 为全量替换：不传即视为关闭。
+
+    该策略存在待生效（pending）的定时变更时拒绝直接更新，返回 409：
+    两条更新路径并发交错会破坏变更应用时的「旧策略 -> 新策略」余额换算，
+    请先取消变更或等其生效后再更新。
     """
-    tenant = tenant_id or EMPTY
-    route = route_id or EMPTY
-    if scope == "global":
-        tenant, route = EMPTY, EMPTY
-    elif scope == "tenant":
-        route = EMPTY
-        if not tenant:
-            raise HTTPException(422, "tenant 作用域必须提供 tenant_id")
-    elif scope == "route":
-        if not tenant or not route:
-            raise HTTPException(422, "route 作用域必须同时提供 tenant_id 与 route_id")
-    else:
-        raise HTTPException(422, f"非法 scope: {scope!r}")
-    if capacity < 0 or refill_rate < 0:
-        raise HTTPException(422, "capacity 与 refill_rate 必须非负")
-    if low_balance_threshold is not None and not (
-        0.0 <= low_balance_threshold <= capacity
-    ):
+    tenant, route = _normalize_scope(scope, tenant_id, route_id)
+    _validate_policy_values(capacity, refill_rate, low_balance_threshold)
+
+    pending = _pending_change(conn, scope, tenant, route)
+    if pending is not None:
         raise HTTPException(
-            422, "low_balance_threshold 必须为 null（关闭）或在 0 到 capacity 之间"
+            409,
+            f"该策略存在待生效的定时变更 change_id={pending['change_id']!r}"
+            f"（effective_at={pending['effective_at']}），请先取消或等其生效后再更新",
         )
 
     ts = now_utc()
@@ -158,6 +200,173 @@ def _policy_out(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+# ------------------------------------------------------------ 策略定时切换
+
+
+def _change_out(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "change_id": row["change_id"],
+        "scope": row["scope"],
+        "tenant_id": row["tenant_id"] or None,
+        "route_id": row["route_id"] or None,
+        "capacity": row["new_capacity"],
+        "refill_rate": row["new_refill_rate"],
+        "low_balance_threshold": row["new_low_balance_threshold"],
+        "effective_at": row["effective_at"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "applied_at": row["applied_at"],
+        "cancelled_at": row["cancelled_at"],
+    }
+
+
+_CHANGE_COLS = (
+    "change_id, scope, tenant_id, route_id, new_capacity, new_refill_rate, "
+    "new_low_balance_threshold, effective_at, status, created_at, "
+    "applied_at, cancelled_at"
+)
+
+
+def create_policy_change(
+    conn: sqlite3.Connection,
+    *,
+    change_id: str,
+    scope: str,
+    tenant_id: Optional[str],
+    route_id: Optional[str],
+    capacity: float,
+    refill_rate: float,
+    low_balance_threshold: Optional[float],
+    effective_at: datetime,
+) -> dict[str, Any]:
+    """为已存在的策略登记一条未来生效的容量/速率/阈值变更。
+
+    约束：目标策略必须已存在（404）；effective_at 必须是未来 UTC 时刻（422）；
+    同一策略至多一条 pending 变更（409）；change_id 全局唯一（409）。
+    """
+    tenant, route = _normalize_scope(scope, tenant_id, route_id)
+    _validate_policy_values(capacity, refill_rate, low_balance_threshold)
+    if effective_at.tzinfo is None:
+        raise HTTPException(422, "effective_at 必须显式带时区（UTC）")
+    effective_at = effective_at.astimezone(timezone.utc)
+
+    ts = now_utc()
+    if not effective_at > ts:
+        raise HTTPException(422, "effective_at 必须是晚于当前时间的未来 UTC 时刻")
+
+    policy = conn.execute(
+        "SELECT 1 FROM policies WHERE scope=? AND tenant_id=? AND route_id=?",
+        (scope, tenant, route),
+    ).fetchone()
+    if policy is None:
+        raise HTTPException(404, "目标策略不存在，请先用 PUT /policies 创建")
+
+    dup = conn.execute(
+        f"SELECT {_CHANGE_COLS} FROM policy_changes WHERE change_id=?",
+        (change_id,),
+    ).fetchone()
+    if dup is not None:
+        raise HTTPException(409, f"change_id={change_id!r} 已存在")
+    if _pending_change(conn, scope, tenant, route) is not None:
+        raise HTTPException(409, "同一策略已存在待生效变更，取消或等其生效后才能提交新的")
+
+    conn.execute(
+        """
+        INSERT INTO policy_changes
+            (change_id, scope, tenant_id, route_id, new_capacity, new_refill_rate,
+             new_low_balance_threshold, effective_at, status, created_at,
+             applied_at, cancelled_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL)
+        """,
+        (
+            change_id, scope, tenant, route, float(capacity), float(refill_rate),
+            None if low_balance_threshold is None else float(low_balance_threshold),
+            iso(effective_at), iso(ts),
+        ),
+    )
+    row = conn.execute(
+        f"SELECT {_CHANGE_COLS} FROM policy_changes WHERE change_id=?",
+        (change_id,),
+    ).fetchone()
+    return _change_out(row)
+
+
+def list_policy_changes(
+    conn: sqlite3.Connection,
+    *,
+    status: Optional[str] = None,
+    scope: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    route_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """列出定时变更，可按 status 与策略键过滤；按提交顺序稳定返回。"""
+    sql = f"SELECT {_CHANGE_COLS} FROM policy_changes"
+    where: list[str] = []
+    params: list[Any] = []
+    if status is not None:
+        where.append("status=?")
+        params.append(status)
+    if scope is not None:
+        where.append("scope=?")
+        params.append(scope)
+    if tenant_id is not None:
+        where.append("tenant_id=?")
+        params.append(tenant_id or EMPTY)
+    if route_id is not None:
+        where.append("route_id=?")
+        params.append(route_id or EMPTY)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id"
+    return [_change_out(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def get_policy_change(conn: sqlite3.Connection, change_id: str) -> dict[str, Any]:
+    row = conn.execute(
+        f"SELECT {_CHANGE_COLS} FROM policy_changes WHERE change_id=?",
+        (change_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, f"change_id={change_id!r} 不存在")
+    return _change_out(row)
+
+
+def cancel_policy_change(conn: sqlite3.Connection, change_id: str) -> dict[str, Any]:
+    """取消一条尚未生效的 pending 变更（重复取消幂等）。
+
+    不存在 -> 404；已生效或已到生效时刻 -> 409；
+    已取消 -> 原样返回该 cancelled 记录。
+    """
+    row = conn.execute(
+        f"SELECT {_CHANGE_COLS} FROM policy_changes WHERE change_id=?",
+        (change_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, f"change_id={change_id!r} 不存在")
+    if row["status"] == "applied":
+        raise HTTPException(
+            409, f"change_id={change_id!r} 已生效，无法取消"
+        )
+    if row["status"] == "cancelled":
+        return _change_out(row)
+
+    ts = now_utc()
+    # 双保险：effective_at 已到期的变更可能正被/已被裁决事务应用，
+    # 只取消仍为 pending 且生效时刻仍在未来的行
+    cur = conn.execute(
+        "UPDATE policy_changes SET status='cancelled', cancelled_at=? "
+        "WHERE change_id=? AND status='pending' AND effective_at > ?",
+        (iso(ts), change_id, iso(ts)),
+    )
+    if cur.rowcount == 0:
+        raise HTTPException(409, f"change_id={change_id!r} 已到生效时刻，无法取消")
+    row = conn.execute(
+        f"SELECT {_CHANGE_COLS} FROM policy_changes WHERE change_id=?",
+        (change_id,),
+    ).fetchone()
+    return _change_out(row)
+
+
 # ---------------------------------------------------------------- 令牌桶
 
 
@@ -221,6 +430,117 @@ def list_buckets(conn: sqlite3.Connection, *, live: bool = True) -> list[dict[st
 # ---------------------------------------------------------------- 裁决
 
 
+def _hit_keys(
+    tenant_id: Optional[str], route_id: Optional[str]
+) -> list[tuple[str, str, str]]:
+    """一次裁决按 全局 -> 租户 -> 路由 顺序命中的策略键。"""
+    keys: list[tuple[str, str, str]] = [("global", EMPTY, EMPTY)]
+    if tenant_id:
+        keys.append(("tenant", tenant_id, EMPTY))
+        if route_id:
+            keys.append(("route", tenant_id, route_id))
+    return keys
+
+
+def _apply_due_changes(
+    conn: sqlite3.Connection,
+    keys: list[tuple[str, str, str]],
+    now: datetime,
+) -> None:
+    """在裁决事务内、裁决之前，应用所有命中且已到期（effective_at <= now）的变更。
+
+    逐条串行应用：每条都在同一事务内完成「余额换算 -> 覆盖策略 -> 标记 applied」，
+    因此并发请求只能观察到完整的旧状态或完整的新状态，不会看到半成品。
+    """
+    now_iso = iso(now)
+    for scope, tenant, route in keys:
+        rows = conn.execute(
+            """
+            SELECT change_id, scope, tenant_id, route_id, new_capacity,
+                   new_refill_rate, new_low_balance_threshold, effective_at
+            FROM policy_changes
+            WHERE scope=? AND tenant_id=? AND route_id=?
+              AND status='pending' AND effective_at <= ?
+            ORDER BY effective_at, id
+            """,
+            (scope, tenant, route, now_iso),
+        ).fetchall()
+        for ch in rows:
+            _apply_policy_change(conn, ch, now)
+
+
+def _apply_policy_change(
+    conn: sqlite3.Connection, ch: sqlite3.Row, now: datetime
+) -> None:
+    """应用单条变更：旧策略补充到 effective_at -> 按比例缩放余额 ->
+    覆盖为新策略 -> 按新速率从 effective_at 补充至 now（由随后的裁决补充完成）。
+
+    余额换算（余额为「剩余比例」语义）：
+      1. 先按旧容量/旧速率把余额补充到 effective_at（上限旧容量）；
+      2. 旧容量为 0 时余额直接置 0，否则
+         balance = 旧余额 / 旧容量 × 新容量（不超过新容量）；
+      3. 桶的 updated_at 置为 effective_at，之后统一按新速率继续补充。
+    """
+    scope, tenant, route = ch["scope"], ch["tenant_id"], ch["route_id"]
+    effective_at = parse_iso(ch["effective_at"])
+    eff_iso = ch["effective_at"]
+    new_cap = float(ch["new_capacity"])
+    new_rate = float(ch["new_refill_rate"])
+    new_threshold = ch["new_low_balance_threshold"]
+
+    old = conn.execute(
+        "SELECT capacity, refill_rate FROM policies "
+        "WHERE scope=? AND tenant_id=? AND route_id=?",
+        (scope, tenant, route),
+    ).fetchone()
+    if old is None:
+        # 策略行已不存在（当前版本不支持删除，仅作防御）：放弃本条
+        return
+    old_cap, old_rate = float(old["capacity"]), float(old["refill_rate"])
+
+    bucket = conn.execute(
+        "SELECT balance, updated_at FROM buckets "
+        "WHERE scope=? AND tenant_id=? AND route_id=?",
+        (scope, tenant, route),
+    ).fetchone()
+    if bucket is None:
+        # 桶尚未惰性创建：没有需要换算的余额，新策略生效后按新容量满额创建
+        pass
+    else:
+        # 1) 旧策略补充到生效时刻
+        at_eff = _refill(
+            bucket["balance"], bucket["updated_at"], old_cap, old_rate, effective_at
+        )
+        # 2) 按剩余比例缩放到新容量（旧容量为 0 -> 余额 0）
+        if old_cap <= 0.0:
+            balance = 0.0
+        else:
+            balance = min(new_cap, at_eff / old_cap * new_cap)
+        # 3) 时间锚点移到 effective_at，后续补充统一走新速率
+        conn.execute(
+            "UPDATE buckets SET balance=?, updated_at=? "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            (balance, eff_iso, scope, tenant, route),
+        )
+
+    conn.execute(
+        """
+        UPDATE policies
+        SET capacity=?, refill_rate=?, low_balance_threshold=?, updated_at=?
+        WHERE scope=? AND tenant_id=? AND route_id=?
+        """,
+        (
+            new_cap, new_rate, new_threshold, eff_iso,
+            scope, tenant, route,
+        ),
+    )
+    conn.execute(
+        "UPDATE policy_changes SET status='applied', applied_at=? "
+        "WHERE change_id=? AND status='pending'",
+        (iso(now), ch["change_id"]),
+    )
+
+
 def _maybe_emit_low_balance(
     conn: sqlite3.Connection,
     state: dict[str, Any],
@@ -275,6 +595,12 @@ def decide(
     if route_id and not tenant_id:
         raise HTTPException(422, "提供 route_id 时必须同时提供 tenant_id")
 
+    now = now_utc()
+
+    # 0) 在同一裁决事务内先应用所有命中且到期的定时策略变更（无后台任务，
+    #    惰性驱动），随后的读策略/读桶看到的必是切换后的完整新状态
+    _apply_due_changes(conn, _hit_keys(tenant_id, route_id), now)
+
     # 1) 幂等：request_id 已存在时，载荷一致则重放，冲突则 409
     existing = conn.execute(
         "SELECT payload_hash, result_json FROM decisions WHERE request_id=?",
@@ -292,8 +618,6 @@ def decide(
         result = json.loads(existing["result_json"])
         result["replayed"] = True
         return result, True
-
-    now = now_utc()
 
     # 2) 解析本次请求命中的策略层（全局 -> 租户 -> 路由），缺省层不做限制
     levels: list[tuple[str, str, str, sqlite3.Row]] = []
@@ -465,11 +789,11 @@ def revoke(conn: sqlite3.Connection, request_id: str) -> tuple[dict[str, Any], b
     now = now_utc()
 
     # 用原裁决载荷定位当时命中的桶；桶行在裁决通过时必然已创建
-    keys: list[tuple[str, str, str]] = [("global", EMPTY, EMPTY)]
-    if payload.get("tenant_id"):
-        keys.append(("tenant", payload["tenant_id"], EMPTY))
-        if payload.get("route_id"):
-            keys.append(("route", payload["tenant_id"], payload["route_id"]))
+    keys = _hit_keys(payload.get("tenant_id"), payload.get("route_id"))
+
+    # 与裁决相同：先在本事务内应用命中且到期的定时变更，再补回令牌，
+    # 避免撤销用旧策略把桶时间锚点推过 effective_at 而重复计息
+    _apply_due_changes(conn, keys, now)
 
     refunded_buckets: list[dict[str, Any]] = []
     for scope, tenant, route in keys:

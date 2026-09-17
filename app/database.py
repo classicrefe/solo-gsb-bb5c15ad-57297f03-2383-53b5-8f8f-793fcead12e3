@@ -68,6 +68,32 @@ CREATE TABLE IF NOT EXISTS low_balance_events (
     created_at     TEXT NOT NULL
 ) STRICT;
 
+-- 策略定时切换：一条变更在 effective_at 到期后，由下一次命中该策略的
+-- 裁决在同一写事务内惰性应用（无后台任务）。status 生命周期：
+-- pending -> applied（已应用）/ cancelled（生效前取消）
+CREATE TABLE IF NOT EXISTS policy_changes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    change_id    TEXT NOT NULL UNIQUE,
+    scope        TEXT NOT NULL,
+    tenant_id    TEXT NOT NULL DEFAULT '',
+    route_id     TEXT NOT NULL DEFAULT '',
+    new_capacity REAL NOT NULL CHECK (new_capacity >= 0),
+    new_refill_rate REAL NOT NULL CHECK (new_refill_rate >= 0),
+    new_low_balance_threshold REAL
+        CHECK (new_low_balance_threshold IS NULL OR new_low_balance_threshold >= 0),
+    effective_at TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending', 'applied', 'cancelled')),
+    created_at   TEXT NOT NULL,
+    applied_at   TEXT,
+    cancelled_at TEXT
+) STRICT;
+
+-- 同一策略至多一条待生效变更（应用/取消后可再提交新的）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_changes_one_pending
+ON policy_changes (scope, tenant_id, route_id)
+WHERE status = 'pending';
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL

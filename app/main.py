@@ -20,6 +20,8 @@ from .schemas import (
     DecideIn,
     DecisionOut,
     LowBalanceEventOut,
+    PolicyChangeIn,
+    PolicyChangeOut,
     PolicyIn,
     PolicyOut,
     RevokeOut,
@@ -38,9 +40,10 @@ app = FastAPI(
         "全局 / 租户 / 路由三级令牌桶配额裁决。"
         "一次裁决在同一事务中补充并扣减所有命中桶，全部满足才扣减；"
         "request_id 幂等重放；支持撤销补回；"
-        "策略可配置 low_balance_threshold，余额越线时产生 low_balance 事件。"
+        "策略可配置 low_balance_threshold，余额越线时产生 low_balance 事件；"
+        "支持提交未来生效的策略定时切换，由裁决在同一事务内惰性应用。"
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -80,6 +83,92 @@ def put_policy(
             refill_rate=body.refill_rate,
             low_balance_threshold=body.low_balance_threshold,
         )
+
+
+# ------------------------------------------------------------ 策略定时切换
+
+
+@app.post(
+    "/policy-changes",
+    response_model=PolicyChangeOut,
+    tags=["策略定时切换"],
+    responses={
+        404: {"description": "目标策略不存在"},
+        409: {"description": "change_id 已存在，或同一策略已有待生效变更"},
+    },
+)
+def post_policy_change(
+    body: PolicyChangeIn, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict:
+    """为已存在的策略登记一条未来生效的定时切换。
+
+    同一策略至多一条 pending 变更；存在 pending 期间 PUT /policies 更新该
+    策略会返回 409。到期后无需后台任务：下一次命中该策略的裁决会在同一
+    BEGIN IMMEDIATE 事务内先应用变更，再执行裁决。
+    """
+    with write_tx(conn):
+        return quota.create_policy_change(
+            conn,
+            change_id=body.change_id,
+            scope=body.scope,
+            tenant_id=body.tenant_id,
+            route_id=body.route_id,
+            capacity=body.capacity,
+            refill_rate=body.refill_rate,
+            low_balance_threshold=body.low_balance_threshold,
+            effective_at=body.effective_at,
+        )
+
+
+@app.get(
+    "/policy-changes",
+    response_model=list[PolicyChangeOut],
+    tags=["策略定时切换"],
+)
+def get_policy_changes(
+    status: str | None = Query(default=None, pattern="^(pending|applied|cancelled)$"),
+    scope: str | None = Query(default=None),
+    tenant_id: str | None = Query(default=None),
+    route_id: str | None = Query(default=None),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> list[dict]:
+    """列出策略定时变更，可按 status / 策略键过滤。只读。"""
+    return quota.list_policy_changes(
+        conn,
+        status=status,
+        scope=scope,
+        tenant_id=tenant_id,
+        route_id=route_id,
+    )
+
+
+@app.get(
+    "/policy-changes/{change_id}",
+    response_model=PolicyChangeOut,
+    tags=["策略定时切换"],
+    responses={404: {"description": "变更不存在"}},
+)
+def get_policy_change(
+    change_id: str, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict:
+    return quota.get_policy_change(conn, change_id)
+
+
+@app.delete(
+    "/policy-changes/{change_id}",
+    response_model=PolicyChangeOut,
+    tags=["策略定时切换"],
+    responses={
+        404: {"description": "变更不存在"},
+        409: {"description": "变更已生效或已到生效时刻，无法取消"},
+    },
+)
+def delete_policy_change(
+    change_id: str, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict:
+    """在生效前取消一条 pending 变更；重复取消幂等。"""
+    with write_tx(conn):
+        return quota.cancel_policy_change(conn, change_id)
 
 
 # ---------------------------------------------------------------- 桶观察

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class PolicyIn(BaseModel):
@@ -28,6 +29,46 @@ class PolicyOut(BaseModel):
     refill_rate: float
     low_balance_threshold: Optional[float]
     updated_at: str
+
+
+class PolicyChangeIn(BaseModel):
+    change_id: str = Field(..., min_length=1, description="变更幂等键，全局唯一")
+    scope: Literal["global", "tenant", "route"]
+    tenant_id: Optional[str] = Field(default=None, description="scope=tenant/route 时必填")
+    route_id: Optional[str] = Field(default=None, description="scope=route 时必填")
+    capacity: float = Field(..., ge=0, description="生效后的新桶容量")
+    refill_rate: float = Field(..., ge=0, description="生效后的新补充速率（令牌/秒）")
+    low_balance_threshold: Optional[float] = Field(
+        default=None,
+        description="生效后的新低余额阈值：null 关闭；否则须在 0 到 capacity 之间",
+    )
+    effective_at: datetime = Field(
+        ...,
+        description="生效时刻（UTC），必须晚于当前时间；支持带偏移的 ISO 8601 时间",
+    )
+
+    @field_validator("effective_at")
+    @classmethod
+    def _effective_must_be_utc(cls, v: datetime) -> datetime:
+        # 不带时区的时间无法可靠解释为 UTC，拒绝并提示显式带 Z / +00:00
+        if v.tzinfo is None:
+            raise ValueError("effective_at 必须显式带时区（UTC，例如 2026-10-01T00:00:00Z）")
+        return v.astimezone(timezone.utc)
+
+
+class PolicyChangeOut(BaseModel):
+    change_id: str
+    scope: str
+    tenant_id: Optional[str]
+    route_id: Optional[str]
+    capacity: float
+    refill_rate: float
+    low_balance_threshold: Optional[float]
+    effective_at: str
+    status: Literal["pending", "applied", "cancelled"]
+    created_at: str
+    applied_at: Optional[str] = None
+    cancelled_at: Optional[str] = None
 
 
 class DecideIn(BaseModel):

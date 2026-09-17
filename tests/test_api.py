@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -40,6 +41,28 @@ def put_policy(client, scope, capacity, refill_rate, tenant=None, route=None,
     if threshold is not _UNSET:
         body["low_balance_threshold"] = threshold
     return client.put("/policies", json=body)
+
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def post_change(client, change_id, scope, capacity, refill_rate, *,
+                effective_in=1.0, tenant=None, route=None, threshold=_UNSET):
+    body = {
+        "change_id": change_id,
+        "scope": scope,
+        "tenant_id": tenant,
+        "route_id": route,
+        "capacity": capacity,
+        "refill_rate": refill_rate,
+        "effective_at": _iso(
+            datetime.now(timezone.utc) + timedelta(seconds=effective_in)
+        ),
+    }
+    if threshold is not _UNSET:
+        body["low_balance_threshold"] = threshold
+    return client.post("/policy-changes", json=body)
 
 
 # ------------------------------------------------------------ 基本扣减与拒绝
@@ -470,3 +493,294 @@ def test_old_database_is_migrated(tmp_path):
         conn.close()
     assert policies[0]["low_balance_threshold"] is None
     assert updated[0]["low_balance_threshold"] == 5.0
+
+
+# ------------------------------------------------------------ 策略定时切换
+
+
+def test_policy_change_lifecycle_and_conflicts(client):
+    put_policy(client, "global", 100, 0)
+
+    # 成功登记
+    r = post_change(client, "ch1", "global", 50, 10, threshold=5,
+                    effective_in=3600)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["change_id"] == "ch1"
+    assert body["status"] == "pending"
+    assert body["capacity"] == 50.0
+    assert body["refill_rate"] == 10.0
+    assert body["low_balance_threshold"] == 5.0
+    assert body["effective_at"].endswith("Z")
+    assert body["applied_at"] is None and body["cancelled_at"] is None
+
+    # 同一策略第二条 pending -> 409
+    assert post_change(client, "ch2", "global", 10, 0,
+                       effective_in=3600).status_code == 409
+    # change_id 重复 -> 409（即使指向另一策略）
+    put_policy(client, "tenant", 5, 0, tenant="t")
+    r = post_change(client, "ch1", "tenant", 5, 0, tenant="t",
+                    effective_in=3600)
+    assert r.status_code == 409
+    # pending 期间 PUT 更新该策略 -> 409
+    assert put_policy(client, "global", 200, 0).status_code == 409
+    # 未涉及 pending 变更的其他策略仍可更新
+    assert put_policy(client, "tenant", 6, 0, tenant="t").status_code == 200
+
+    # 列表 / 查询 / 过滤
+    assert client.get("/policy-changes").json()[0]["change_id"] == "ch1"
+    pending = client.get("/policy-changes", params={"status": "pending"}).json()
+    assert [c["change_id"] for c in pending] == ["ch1"]
+    assert client.get(
+        "/policy-changes", params={"scope": "global", "status": "applied"}
+    ).json() == []
+    assert client.get("/policy-changes/ch1").status_code == 200
+    assert client.get("/policy-changes/missing").status_code == 404
+
+    # 取消后：PUT 恢复、可再提交；重复取消幂等
+    r = client.delete("/policy-changes/ch1")
+    assert r.status_code == 200 and r.json()["status"] == "cancelled"
+    assert r.json()["cancelled_at"]
+    assert client.delete("/policy-changes/ch1").json()["status"] == "cancelled"
+    assert put_policy(client, "global", 200, 0).status_code == 200
+    r = post_change(client, "ch1b", "global", 50, 10, effective_in=3600)
+    assert r.status_code == 200
+
+
+def test_policy_change_validation(client):
+    put_policy(client, "global", 100, 0)
+    put_policy(client, "tenant", 10, 0, tenant="t")
+
+    # 目标策略不存在 -> 404
+    r = post_change(client, "x", "tenant", 5, 0, tenant="nope",
+                    effective_in=10)
+    assert r.status_code == 404
+    # 非法 scope 组合 / 越界阈值 -> 422
+    r = post_change(client, "x", "tenant", 5, 0, effective_in=10)
+    assert r.status_code == 422
+    r = post_change(client, "x", "global", 10, 0, threshold=11,
+                    effective_in=10)
+    assert r.status_code == 422
+    # effective_at 必须是未来
+    r = client.post("/policy-changes", json={
+        "change_id": "x", "scope": "global", "capacity": 10, "refill_rate": 0,
+        "effective_at": _iso(datetime.now(timezone.utc) - timedelta(seconds=5)),
+    })
+    assert r.status_code == 422
+    # effective_at 必须显式带时区
+    r = client.post("/policy-changes", json={
+        "change_id": "x", "scope": "global", "capacity": 10, "refill_rate": 0,
+        "effective_at": "2026-10-01T00:00:00",
+    })
+    assert r.status_code == 422
+    # 未知 status 过滤值 -> 422
+    assert client.get("/policy-changes", params={"status": "wat"}).status_code == 422
+
+
+def test_decide_before_effective_keeps_old_policy(client):
+    put_policy(client, "global", 100, 0)
+    post_change(client, "ch1", "global", 50, 0, threshold=10, effective_in=3600)
+    # 未到生效时刻：容量/速率/阈值全按旧策略走
+    r = client.post("/decide", json={"request_id": "d1", "cost": 100}).json()
+    assert r["allowed"] is True
+    assert r["buckets"][0]["capacity"] == 100.0
+    assert r["buckets"][0]["balance"] == 0.0
+    assert client.get("/policy-changes/ch1").json()["status"] == "pending"
+    # 桶观察接口同样仍是旧容量
+    assert client.get("/buckets").json()[0]["capacity"] == 100.0
+
+
+def test_change_application_scales_balance_proportionally(client):
+    # 旧容量 100、速率 0；花掉 20 -> 剩余比例 0.8
+    put_policy(client, "global", 100, 0)
+    client.post("/decide", json={"request_id": "d1", "cost": 20})
+    post_change(client, "ch1", "global", 50, 0, effective_in=1)
+
+    import time
+    time.sleep(1.2)
+    # 到期首次裁决：余额应换算为 0.8*50 = 40；速率仍为 0
+    r = client.post("/decide", json={"request_id": "d2", "cost": 40}).json()
+    assert r["allowed"] is True
+    b = r["buckets"][0]
+    assert b["capacity"] == 50.0
+    assert b["refill_rate"] == 0.0
+    assert b["balance"] == pytest.approx(0.0, abs=1e-9)
+    ch = client.get("/policy-changes/ch1").json()
+    assert ch["status"] == "applied" and ch["applied_at"]
+    # applied 后可以提交新的 pending，也可以直接 PUT
+    assert post_change(client, "ch2", "global", 10, 0,
+                       effective_in=3600).status_code == 200
+    assert client.delete("/policy-changes/ch2").status_code == 200
+    assert put_policy(client, "global", 50, 0).status_code == 200
+
+
+def test_change_application_refills_old_then_new_rate(client):
+    # 旧容量 100、速率 10；花掉 80（余 20）。变更在 1s 后生效 -> 旧速率先补满
+    # 到 30（20+10*1）；新容量 200 -> 余额 60；随后按新速率 20/s 继续补充。
+    put_policy(client, "global", 100, 10)
+    client.post("/decide", json={"request_id": "d1", "cost": 80})
+    post_change(client, "ch1", "global", 200, 20, effective_in=1)
+
+    import time
+    time.sleep(1.3)
+    r = client.post("/decide", json={"request_id": "d2", "cost": 1}).json()
+    assert r["allowed"] is True
+    b = r["buckets"][0]
+    assert b["capacity"] == 200.0
+    assert b["refill_rate"] == 20.0
+    # 60 + 20*（裁决时刻-effective_at 约 0.3s+）- 1，区间断言避开计时抖动
+    assert 63.0 < b["balance"] < 75.0, b["balance"]
+
+
+def test_change_from_zero_capacity_balance_starts_zero(client):
+    # 旧容量 0：被拒裁决也会把余额 0 的桶行落库；规格规定旧容量为 0 时余额为 0，
+    # 故切换后余额从 0 开始按「新速率」补充（而不是凭空按新容量满额）
+    put_policy(client, "global", 0, 0)
+    r = client.post("/decide", json={"request_id": "d1", "cost": 1}).json()
+    assert r["allowed"] is False
+    assert client.get("/buckets").json()[0]["balance"] == 0.0
+    post_change(client, "ch1", "global", 10, 100, effective_in=1)
+
+    import time
+    time.sleep(1.15)
+    # 生效瞬间余额 0，新速率 100/s 补充到裁决时刻，已回满到新容量 10
+    r = client.post("/decide", json={"request_id": "d2", "cost": 10}).json()
+    assert r["allowed"] is True
+    assert r["buckets"][0]["capacity"] == 10.0
+    assert r["buckets"][0]["balance"] == 0.0
+
+
+def test_change_with_old_capacity_zero_and_existing_bucket(client):
+    # 旧容量 0 但桶行已存在（先非零打空再 PUT 成 0）：换算后余额必须为 0
+    put_policy(client, "global", 5, 0)
+    client.post("/decide", json={"request_id": "d1", "cost": 5})
+    put_policy(client, "global", 0, 0)
+    post_change(client, "ch1", "global", 100, 0, effective_in=1)
+
+    import time
+    time.sleep(1.2)
+    r = client.post("/decide", json={"request_id": "d2", "cost": 1}).json()
+    assert r["allowed"] is False
+    assert r["buckets"][0]["balance"] == 0.0
+
+
+def test_change_threshold_applies_after_effective(client):
+    put_policy(client, "global", 100, 0)
+    client.post("/decide", json={"request_id": "d1", "cost": 50})  # 余 50，旧阈值关闭
+    post_change(client, "ch1", "global", 100, 0, threshold=10, effective_in=1)
+
+    import time
+    time.sleep(1.2)
+    # 50 -> 45：仍高于新阈值 10，无事件
+    client.post("/decide", json={"request_id": "d2", "cost": 5})
+    assert client.get("/events").json() == []
+    # 45 -> 5：越过新阈值，产生事件，事件记录的是新阈值
+    client.post("/decide", json={"request_id": "d3", "cost": 40})
+    events = client.get("/events").json()
+    assert len(events) == 1
+    assert events[0]["threshold"] == 10.0
+    assert events[0]["balance_before"] == 45.0
+    assert events[0]["balance_after"] == 5.0
+
+
+def test_change_application_is_multilevel_and_atomic(client):
+    put_policy(client, "global", 100, 0)
+    put_policy(client, "tenant", 100, 0, tenant="t")
+    client.post("/decide", json={"request_id": "d1", "tenant_id": "t", "cost": 50})
+    post_change(client, "cg", "global", 10, 0, effective_in=1)
+    post_change(client, "ct", "tenant", 10, 0, tenant="t", effective_in=1)
+
+    import time
+    time.sleep(1.2)
+    # 同一裁决事务同时应用两条变更：两桶余额都按 0.5 比例缩到 5
+    r = client.post(
+        "/decide", json={"request_id": "d2", "tenant_id": "t", "cost": 5}
+    ).json()
+    assert r["allowed"] is True
+    by_scope = {b["scope"]: b["balance"] for b in r["buckets"]}
+    assert by_scope == {"global": 0.0, "tenant": 0.0}
+    statuses = {c["change_id"]: c["status"] for c in client.get(
+        "/policy-changes").json()}
+    assert statuses == {"cg": "applied", "ct": "applied"}
+
+
+def test_concurrent_decisions_apply_change_consistently(client):
+    # 旧容量 100 满额 -> 2s 后切换为容量 50（满额比例 1 => 50），速率始终 0。
+    # 阶段一在生效前打 60 个：全部按旧策略放行，余 40（无任何请求看到新策略）；
+    # 等切换到期后阶段二并发打 60 个：新容量余额 50/100*50=20，只能再放 20。
+    # 每个请求看到的要么全旧要么全新，总扣减恰好 80，绝不超发。
+    put_policy(client, "global", 100, 0)
+    post_change(client, "cg", "global", 50, 0, effective_in=2)
+
+    results: list[bool] = []
+    caps: list[float] = []
+    lock = threading.Lock()
+
+    def worker(prefix, n):
+        for i in range(n):
+            body = client.post(
+                "/decide", json={"request_id": f"{prefix}-{i}", "cost": 1}
+            ).json()
+            with lock:
+                results.append(body["allowed"])
+                caps.append(body["buckets"][0]["capacity"])
+
+    t1 = [threading.Thread(target=worker, args=(f"b{j}", 15)) for j in range(4)]
+    for t in t1:
+        t.start()
+    for t in t1:
+        t.join()
+    assert all(cap == 100.0 for cap in caps), caps
+    assert sum(results) == 60
+
+    import time
+    time.sleep(2.2)  # 等待生效
+
+    t2 = [threading.Thread(target=worker, args=(f"a{j}", 15)) for j in range(4)]
+    for t in t2:
+        t.start()
+    for t in t2:
+        t.join()
+
+    # 生效后的请求全部看到新容量（不会出现旧状态/中间态）
+    assert all(cap == 50.0 for cap in caps[60:]), caps[60:]
+    assert sum(results) == 80
+    buckets = client.get("/buckets").json()
+    assert buckets[0]["capacity"] == 50.0
+    assert buckets[0]["balance"] == 0.0
+    assert client.get("/policy-changes/cg").json()["status"] == "applied"
+
+
+def test_revoke_applies_due_change_before_refund(client):
+    # 旧容量 100 速率 0：花掉 80（余 20）；1s 后切到容量 50、速率 100。
+    # 到期后先撤销：变更应在撤销事务内先应用（余额 20/100*50=10），
+    # 再按新速率补充并补回 80，最终以新容量 50 截断 -> 恰好 50
+    put_policy(client, "global", 100, 0)
+    client.post("/decide", json={"request_id": "d1", "cost": 80})
+    post_change(client, "ch1", "global", 50, 100, effective_in=1)
+
+    import time
+    time.sleep(1.15)
+    r = client.post("/decide/d1/revoke")
+    assert r.status_code == 200
+    b = r.json()["buckets"][0]
+    assert b["capacity"] == 50.0
+    assert b["refill_rate"] == 100.0
+    assert b["balance"] == 50.0
+    assert client.get("/policy-changes/ch1").json()["status"] == "applied"
+
+
+def test_cancel_after_effective_time_conflicts(client):
+    put_policy(client, "global", 100, 0)
+    post_change(client, "ch1", "global", 50, 0, effective_in=1)
+    assert client.delete("/policy-changes/ch1").status_code == 200
+    # 取消后已无 pending，可以重新提交一条
+    post_change(client, "ch2", "global", 50, 0, effective_in=1)
+
+    import time
+    time.sleep(1.2)
+    # 到期后取消 -> 409；触发一次裁决令其应用
+    assert client.delete("/policy-changes/ch2").status_code == 409
+    client.post("/decide", json={"request_id": "d1", "cost": 1})
+    assert client.get("/policy-changes/ch2").json()["status"] == "applied"
+    assert client.delete("/policy-changes/ch2").status_code == 409
